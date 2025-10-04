@@ -1,8 +1,21 @@
 import os, io, hashlib, re
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import numpy as np
 import streamlit as st
-from pypdf import PdfReader
+
+# Prefer PyMuPDF (cleaner text), fall back to pypdf
+try:
+    import fitz  # PyMuPDF
+    HAVE_PYMUPDF = True
+except Exception:
+    HAVE_PYMUPDF = False
+
+try:
+    from pypdf import PdfReader
+    HAVE_PYPDF = True
+except Exception:
+    HAVE_PYPDF = False
+
 from openai import OpenAI
 
 # ---------- Page ----------
@@ -32,17 +45,84 @@ with st.sidebar:
 uploaded = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
 
 # ---------- Helpers ----------
-def read_pdf_text(file) -> List[Tuple[int, str]]:
-    """Return [(page_number, text)] for a PDF (1-indexed pages)."""
-    reader = PdfReader(io.BytesIO(file.read()))
+NBSP = "\u00A0"
+SOFT_HY = "\u00AD"
+LIGATURES = {
+    "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl", "\ufb03": "ffi", "\ufb04": "ffl",
+}
+
+def normalize_pdf_text(txt: str) -> str:
+    """Clean noisy PDF text BEFORE chunking/embedding."""
+    if not txt:
+        return ""
+    # Replace ligatures, non-breaking spaces, soft hyphens
+    for k,v in LIGATURES.items():
+        txt = txt.replace(k, v)
+    txt = txt.replace(NBSP, " ").replace(SOFT_HY, "")
+    # Remove stray markdown markers that later trigger formatting
+    txt = txt.replace("**", "").replace("*", "").replace("_", " ")
+    # Collapse whitespace
+    txt = re.sub(r"[ \t\r\f\v]+", " ", txt)
+    # Insert missing spaces between digits/letters and letters/digits
+    txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)
+    txt = re.sub(r"([A-Za-z])(\d)", r"\1 \2", txt)
+    # Fix thousands: "1, 000" -> "1,000"
+    txt = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", txt)
+    # Normalize commas: " , " -> ", "
+    txt = re.sub(r"\s*,\s*", ", ", txt)
+    txt = re.sub(r"\s{2,}", " ", txt).strip()
+    # Common lease/policy artifacts glued together
+    fixes = {
+        "permonth": "per month",
+        "isalso": "is also",
+        "andthe": "and the",
+        "andthere": "and there",
+        "securitydeposit": "security deposit",
+        "refundabledeposit": "refundable deposit",
+        "depositis": "deposit is",
+        "rentis": "rent is",
+        "dueprior": "due prior",
+    }
+    low = txt.lower()
+    for bad, good in fixes.items():
+        if bad in low:
+            txt = re.sub(bad, good, txt, flags=re.IGNORECASE)
+    return txt
+
+def read_pdf_text_pymupdf(file_bytes: bytes) -> List[Tuple[int, str]]:
+    """Use PyMuPDF for cleaner extraction."""
     pages = []
+    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+        for i, page in enumerate(doc, start=1):
+            txt = page.get_text("text", flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE) or ""
+            pages.append((i, normalize_pdf_text(txt)))
+    return pages
+
+def read_pdf_text_pypdf(file_bytes: bytes) -> List[Tuple[int, str]]:
+    """Fallback extractor using pypdf."""
+    pages = []
+    reader = PdfReader(io.BytesIO(file_bytes))
     for i, page in enumerate(reader.pages, start=1):
         try:
             txt = page.extract_text() or ""
         except Exception:
             txt = ""
-        pages.append((i, txt.strip()))
+        pages.append((i, normalize_pdf_text(txt)))
     return pages
+
+def read_pdf_pages(file) -> List[Tuple[int, str]]:
+    file_bytes = file.read()
+    if HAVE_PYMUPDF:
+        try:
+            return read_pdf_text_pymupdf(file_bytes)
+        except Exception:
+            pass
+    if HAVE_PYPDF:
+        try:
+            return read_pdf_text_pypdf(file_bytes)
+        except Exception:
+            pass
+    return []
 
 def chunk_pages(pages: List[Tuple[int, str]], chars_per_chunk=2000, overlap=200):
     """Greedy char chunking across pages; keep page refs in each chunk."""
@@ -54,13 +134,13 @@ def chunk_pages(pages: List[Tuple[int, str]], chars_per_chunk=2000, overlap=200)
         pos = 0
         while pos < len(text):
             take = text[pos:pos+chars_per_chunk]
-            if buf == "":
+            if not buf:
                 start_page = pno
-            buf += ("\n" + take) if buf else take
+            buf += ("" if not buf else "\n") + take
             end_page = pno
             if len(buf) >= chars_per_chunk:
                 chunks.append(((start_page, end_page), buf))
-                buf = buf[-overlap:]  # small overlap
+                buf = buf[-overlap:]
                 start_page = pno
             pos += chars_per_chunk
     if buf:
@@ -81,30 +161,19 @@ def hash_docs(files) -> str:
     return h.hexdigest()[:16]
 
 def clean_answer(txt: str) -> str:
-    """
-    Strong cleanup for PDF artifacts the model may echo.
-    - remove stray *, ** and underscores (markdown / OCR noise)
-    - collapse whitespace
-    - fix missing spaces between digits/letters
-    - normalize thousands: '1, 000' -> '1,000'
-    - normalize spaces around commas
-    - patch common glued phrases from leases/policies
-    """
+    """Post-clean the final answer (belt & suspenders)."""
     # strip markdown-ish markers
     txt = txt.replace("**", "").replace("*", "").replace("_", " ")
-
     # whitespace & number/letter spacing
     txt = re.sub(r"\s+", " ", txt)
     txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)
     txt = re.sub(r"([A-Za-z])(\d)", r"\1 \2", txt)
-
     # 1, 000 -> 1,000
     txt = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", txt)
-
-    # spaces around commas
+    # commas
     txt = re.sub(r"\s*,\s*", ", ", txt)
     txt = re.sub(r"\s{2,}", " ", txt).strip()
-
+    # common glue fixes
     fixes = {
         "permonth": "per month",
         "isalso": "is also",
@@ -120,7 +189,6 @@ def clean_answer(txt: str) -> str:
     for bad, good in fixes.items():
         if bad in low:
             txt = re.sub(bad, good, txt, flags=re.IGNORECASE)
-
     return txt
 
 # ---------- OpenAI client ----------
@@ -157,9 +225,10 @@ if uploaded:
 
         all_chunks, metas = [], []
         for uf in uploaded:
-            pages = read_pdf_text(uf)
+            pages = read_pdf_pages(uf)
             chs = chunk_pages(pages, chars_per_chunk=CHARS_PER_CHUNK)
             for (p1, p2), text in chs:
+                # text already normalized by extractor
                 all_chunks.append(text)
                 metas.append({"file": uf.name, "pages": (p1, p2)})
 
@@ -242,6 +311,13 @@ if uploaded:
                 "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words)."
             )
 
+        # Nudge the model to structure money answers nicely when relevant
+        formatting_hint = (
+            "If the question asks about amounts (e.g., rent/deposit/fees), "
+            "output short bullets like:\n"
+            "- Monthly Rent: $X\n- Security Deposit: $Y\n- Total due before move-in: $Z\n"
+        )
+
         user_prompt = f"""
 You are an expert policy analyst. Be precise and concise.
 
@@ -249,6 +325,8 @@ Question:
 {q}
 
 {guardrails}
+
+{formatting_hint}
 
 Sources:
 {context}
