@@ -52,7 +52,7 @@ with st.sidebar:
                                 help="Lower = strict & factual. Higher = more flexible wording.")
         TOP_K = st.slider("Context chunks (K)", 2, 8, 4)
         CHARS_PER_CHUNK = st.slider("Chunk size (chars)", 1000, 4000, 2000, step=250)
-        # 👉 default ON now
+        # default ON
         polish_output = st.checkbox(
             "Polish final answer (extra tiny model pass)",
             value=True,
@@ -334,6 +334,15 @@ if uploaded:
                 "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words)."
             )
 
+        # NEW: enforce Markdown formatting with one bullet per line when there are multiple points
+        format_enforce = (
+            "Format the answer as clean **Markdown**. "
+            "If there are multiple points, present them as a bullet list using '-' with each item on its own line. "
+            "Keep citations like [page N] at the end of the relevant line. "
+            "Avoid copying raw PDF text; paraphrase cleanly."
+        )
+
+        # Helpful hint for amounts (kept)
         formatting_hint = (
             "If the question asks about amounts (e.g., rent/deposit/fees), "
             "return them as short bullets:\n"
@@ -347,6 +356,8 @@ Question:
 {q}
 
 {guardrails}
+
+{format_enforce}
 
 {formatting_hint}
 
@@ -370,11 +381,12 @@ Sources:
         raw_answer = resp.choices[0].message.content
         answer = clean_answer(raw_answer)
 
-        # 5) Optional polish pass (now default ON via sidebar)
+        # 5) Optional polish pass (default ON)
         if polish_output:
             status.update(label="Polishing answer…", state="running")
             polish_prompt = f"""
-Rewrite the following answer cleanly in bullet points if it contains amounts.
+Rewrite the following answer cleanly in Markdown. 
+If it contains multiple points, use a bullet list ('- ') with one item per line.
 Keep numbers/currency and the citations like [page N]. Do not add new facts.
 
 Answer:
