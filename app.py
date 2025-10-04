@@ -25,8 +25,10 @@ st.set_page_config(page_title="📄 Policy & PDF Q&A", layout="wide")
 st.markdown(
     """
     <style>
-      /* Hide the tiny "Press Ctrl+Enter…" hint under text inputs/areas */
+      /* Hide the tiny hints under the text area/input */
       .stTextArea small, .stTextInput small { display: none !important; }
+      /* Extra safety: hide any 'small' hint that follows a textarea wrapper */
+      textarea + div small { display: none !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -190,14 +192,23 @@ def hash_docs(files) -> str:
     return h.hexdigest()[:16]
 
 def clean_answer(txt: str) -> str:
-    """Post-clean the final answer (belt & suspenders)."""
-    txt = txt.replace("**", "").replace("*", "").replace("_", " ")
-    txt = re.sub(r"\s+", " ", txt)
+    """Post-clean the final answer WITHOUT destroying newlines (so bullets render)."""
+    if not txt:
+        return txt
+
+    # Keep line breaks; only collapse spaces/tabs.
+    txt = txt.replace("\r", "")
+    txt = re.sub(r"[ \t\f\v]+", " ", txt)       # collapse spaces/tabs, keep \n
+    txt = re.sub(r"\n[ \t]+", "\n", txt)        # tidy spaces after newlines
+    txt = re.sub(r"\n{3,}", "\n\n", txt)        # limit blank lines
+
+    # Number/letter spacing and comma normalization
     txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)
     txt = re.sub(r"([A-Za-z])(\d)", r"\1 \2", txt)
     txt = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", txt)
     txt = re.sub(r"\s*,\s*", ", ", txt)
-    txt = re.sub(r"\s{2,}", " ", txt).strip()
+    txt = txt.strip()
+
     fixes = {
         "permonth": "per month",
         "isalso": "is also",
@@ -334,7 +345,7 @@ if uploaded:
                 "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words)."
             )
 
-        # NEW: enforce Markdown formatting with one bullet per line when there are multiple points
+        # Enforce clean Markdown with proper bullets (one item per line)
         format_enforce = (
             "Format the answer as clean **Markdown**. "
             "If there are multiple points, present them as a bullet list using '-' with each item on its own line. "
