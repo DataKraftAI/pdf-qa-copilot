@@ -1,4 +1,4 @@
-import os, io, math, hashlib, re
+import os, io, hashlib, re
 from typing import List, Tuple
 import numpy as np
 import streamlit as st
@@ -10,19 +10,18 @@ st.set_page_config(page_title="📄 Policy & PDF Q&A", layout="wide")
 st.title("📄 Policy & PDF Q&A")
 st.caption("Upload PDFs (policy, contract, handbook), then ask natural-language questions. Answers cite pages.")
 
-# ---------- Sidebar (budget + model) ----------
+# ---------- Sidebar (budget + advanced) ----------
 with st.sidebar:
     st.header("Settings")
-    # Hard budget (demo guard). Also set a hard limit in your OpenAI dashboard.
+    # Demo budget guard (still set a hard limit in your OpenAI dashboard)
     BUDGET_DOLLARS = float(st.secrets.get("BUDGET_DOLLARS", os.getenv("BUDGET_DOLLARS", "5")))
-    st.write(f"Demo budget: **${BUDGET_DOLLARS:.2f}/month** (app guard)")
+    st.write(f"Demo budget: **${BUDGET_DOLLARS:.2f}/month**")
 
-    # Prices per 1M tokens (USD) – gpt-4o-mini + embeddings small
-    PRICE_IN_PER_M   = float(st.secrets.get("PRICE_IN_PER_M",   "0.15"))  # input
-    PRICE_OUT_PER_M  = float(st.secrets.get("PRICE_OUT_PER_M",  "0.60"))  # output
-    PRICE_EMB_PER_M  = float(st.secrets.get("PRICE_EMB_PER_M",  "0.02"))  # embeddings
+    # Prices per 1M tokens (USD)
+    PRICE_IN_PER_M   = float(st.secrets.get("PRICE_IN_PER_M",   "0.15"))  # gpt-4o-mini input
+    PRICE_OUT_PER_M  = float(st.secrets.get("PRICE_OUT_PER_M",  "0.60"))  # gpt-4o-mini output
+    PRICE_EMB_PER_M  = float(st.secrets.get("PRICE_EMB_PER_M",  "0.02"))  # text-embedding-3-small
 
-    # Advanced (can hide later)
     with st.expander("Advanced"):
         temperature = st.slider("Creativity", 0.0, 1.0, 0.2,
                                 help="Lower = strict & factual. Higher = more flexible wording.")
@@ -61,8 +60,7 @@ def chunk_pages(pages: List[Tuple[int, str]], chars_per_chunk=2000, overlap=200)
             end_page = pno
             if len(buf) >= chars_per_chunk:
                 chunks.append(((start_page, end_page), buf))
-                # keep small overlap
-                buf = buf[-overlap:]
+                buf = buf[-overlap:]  # small overlap
                 start_page = pno
             pos += chars_per_chunk
     if buf:
@@ -85,17 +83,25 @@ def hash_docs(files) -> str:
 def clean_answer(txt: str) -> str:
     """
     Strong cleanup for PDF artifacts the model may echo.
-    - remove stray asterisks/markdown
+    - remove stray *, ** and underscores (markdown / OCR noise)
     - collapse whitespace
-    - fix missing spaces 1000and -> 1000 and / word123 -> word 123
-    - normalize commas (1, 000 -> 1,000; spaces around commas)
-    - patch common glued phrases
+    - fix missing spaces between digits/letters
+    - normalize thousands: '1, 000' -> '1,000'
+    - normalize spaces around commas
+    - patch common glued phrases from leases/policies
     """
-    txt = txt.replace("**", "").replace("*", "")
+    # strip markdown-ish markers
+    txt = txt.replace("**", "").replace("*", "").replace("_", " ")
+
+    # whitespace & number/letter spacing
     txt = re.sub(r"\s+", " ", txt)
     txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)
     txt = re.sub(r"([A-Za-z])(\d)", r"\1 \2", txt)
+
+    # 1, 000 -> 1,000
     txt = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", txt)
+
+    # spaces around commas
     txt = re.sub(r"\s*,\s*", ", ", txt)
     txt = re.sub(r"\s{2,}", " ", txt).strip()
 
@@ -108,11 +114,13 @@ def clean_answer(txt: str) -> str:
         "refundabledeposit": "refundable deposit",
         "depositis": "deposit is",
         "rentis": "rent is",
+        "dueprior": "due prior",
     }
     low = txt.lower()
     for bad, good in fixes.items():
         if bad in low:
             txt = re.sub(bad, good, txt, flags=re.IGNORECASE)
+
     return txt
 
 # ---------- OpenAI client ----------
@@ -128,7 +136,6 @@ if "spent_cents" not in st.session_state:
     st.session_state.spent_cents = 0.0
 
 def check_and_add_cost(input_toks=0, output_toks=0, embed_toks=0):
-    # Convert to USD cents using current prices
     cost = (input_toks/1e6)*PRICE_IN_PER_M + (output_toks/1e6)*PRICE_OUT_PER_M + (embed_toks/1e6)*PRICE_EMB_PER_M
     st.session_state.spent_cents += cost * 100
     if (st.session_state.spent_cents/100) > BUDGET_DOLLARS:
@@ -147,6 +154,7 @@ if uploaded:
     else:
         status = st.status("Preparing your documents…", expanded=True)
         status.update(label="Extracting pages…", state="running")
+
         all_chunks, metas = [], []
         for uf in uploaded:
             pages = read_pdf_text(uf)
@@ -162,6 +170,7 @@ if uploaded:
         client = get_client()
         embed_input_tokens = sum(approx_tokens(c) for c in all_chunks)
         check_and_add_cost(embed_toks=embed_input_tokens)
+
         status.update(label="Embedding chunks…", state="running")
         emb_resp = client.embeddings.create(model="text-embedding-3-small", input=all_chunks)
         emb_matrix = np.array([e.embedding for e in emb_resp.data], dtype=np.float32)
@@ -187,13 +196,15 @@ if uploaded:
             st.stop()
 
         client = get_client()
-
         status = st.status("Answering…", expanded=True)
+
+        # 1) Embed query
         status.update(label="Embedding your question…", state="running")
         q_tokens = approx_tokens(q)
         check_and_add_cost(embed_toks=q_tokens)
         q_emb = client.embeddings.create(model="text-embedding-3-small", input=q).data[0].embedding
 
+        # 2) Retrieve top-K
         status.update(label="Retrieving relevant passages…", state="running")
         q_vec = np.array(q_emb, dtype=np.float32)
         matrix = st.session_state.index_cache[hash_docs(uploaded)][2]
@@ -206,28 +217,28 @@ if uploaded:
             text = cache[0][int(i)]
             meta = cache[1][int(i)]
             p1, p2 = meta["pages"]
-            source = f'{meta["file"]} (pp. {p1}-{p2})' if p1 != p2 else f'{meta["file"]} (p. {p1})'
+            source = f'{meta["file"]} (pages {p1}-{p2})' if p1 != p2 else f'{meta["file"]} (page {p1})'
             selected.append((source, text))
 
         context_blocks = [f"[Source: {src}]\n{txt}" for src, txt in selected]
         context = "\n\n---\n\n".join(context_blocks)
 
-        # Guardrails (paraphrase, cite pages, fix artifacts — still strict if enabled)
+        # 3) Build prompt (paraphrase cleanly, cite [page N], fix artifacts)
         if strict:
             guardrails = (
                 "Answer using only the provided sources.\n"
-                "Do not copy sentences verbatim—paraphrase in clean, human-readable English.\n"
-                "State amounts clearly (e.g., $1,000) and keep units.\n"
-                "Cite the page(s) like [p. 3] or [Policy.pdf p. 12].\n"
+                "Paraphrase in clean, human-readable English (do not copy raw text).\n"
+                "State amounts clearly with currency (e.g., $1,000) and keep units.\n"
+                "Cite the page(s) like [page 3] or [Policy.pdf page 12].\n"
                 "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words).\n"
                 "Do not invent content. If unclear or not present, say 'Not found in the documents.'"
             )
         else:
             guardrails = (
                 "Prefer the provided sources; if unclear, you may infer cautiously.\n"
-                "Paraphrase in clean, human-readable English.\n"
-                "State amounts clearly (e.g., $1,000) and keep units.\n"
-                "Cite the page(s) like [p. 3] or [Policy.pdf p. 12].\n"
+                "Paraphrase in clean, human-readable English (do not copy raw text).\n"
+                "State amounts clearly with currency (e.g., $1,000) and keep units.\n"
+                "Cite the page(s) like [page 3] or [Policy.pdf page 12].\n"
                 "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words)."
             )
 
@@ -243,10 +254,12 @@ Sources:
 {context}
 """.strip()
 
+        # Budget guard for the chat completion
         in_tokens = approx_tokens(user_prompt)
-        out_tokens = 500  # cap
+        out_tokens = 500
         check_and_add_cost(input_toks=in_tokens, output_toks=out_tokens)
 
+        # 4) Generate answer
         status.update(label="Generating answer…", state="running")
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
