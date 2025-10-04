@@ -1,4 +1,4 @@
-import os, io, math, hashlib
+import os, io, math, hashlib, re
 from typing import List, Tuple
 import numpy as np
 import streamlit as st
@@ -82,10 +82,23 @@ def hash_docs(files) -> str:
         f.seek(0); h.update(f.read()); f.seek(0)
     return h.hexdigest()[:16]
 
+def clean_answer(txt: str) -> str:
+    """
+    Light cleanup for PDF extraction artifacts the model may echo.
+    - collapse excessive whitespace
+    - fix missing spaces between numbers/words: '1000and' -> '1000 and'
+    - normalize spaces around commas
+    """
+    txt = re.sub(r"\s+", " ", txt)
+    txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)     # 1000and -> 1000 and
+    txt = re.sub(r"\s*,\s*", ", ", txt)                # , spacing
+    return txt.strip()
+
 # ---------- OpenAI client ----------
 def get_client() -> OpenAI:
     key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
     if not key:
+        st.error("No API key found. Add OPENAI_API_KEY in Streamlit → Settings → Secrets.")
         st.stop()
     return OpenAI(api_key=key)
 
@@ -146,7 +159,7 @@ if uploaded:
 if uploaded:
     st.subheader("Ask a question")
     q = st.text_input("Example: What does the leave policy say about sick days?")
-    strict = st.checkbox("Strict mode (answer only from the PDFs; say 'not found' if unclear)", value=True)
+    strict = st.checkbox("Strict mode (answer only from the PDFs; say 'Not found' if unclear)", value=True)
 
     if st.button("🔎 Get answer"):
         if not index_ready:
@@ -183,14 +196,22 @@ if uploaded:
             context_blocks.append(f"[Source: {src}]\n{txt}")
         context = "\n\n---\n\n".join(context_blocks)
 
-        # System/user prompt
-        guardrails = (
-            "Answer using only the provided sources.\n"
-            "Quote briefly and cite the page(s) like [p. 3] or [Policy.pdf p. 12].\n"
-            "If the answer is unclear or not present, say 'Not found in the documents.'"
-            if strict else
-            "Prefer the provided sources; if unclear, you may infer cautiously."
-        )
+        # Guardrails text
+        if strict:
+            guardrails = (
+                "Answer using only the provided sources.\n"
+                "Quote briefly and **cite the page(s)** like [p. 3] or [Policy.pdf p. 12].\n"
+                "Present the answer in **clean, human-readable sentences**. "
+                "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words). "
+                "Do **not** invent content. If unclear or not present, say **'Not found in the documents.'**"
+            )
+        else:
+            guardrails = (
+                "Prefer the provided sources; if unclear, you may infer cautiously.\n"
+                "Quote briefly and **cite the page(s)** like [p. 3] or [Policy.pdf p. 12].\n"
+                "Present the answer in **clean, human-readable sentences**. "
+                "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words)."
+            )
 
         user_prompt = f"""
 You are an expert policy analyst. Be precise and concise.
@@ -216,10 +237,11 @@ Sources:
             temperature=temperature,
             max_tokens=out_tokens,
         )
-        answer = resp.choices[0].message.content
+        raw_answer = resp.choices[0].message.content
+        answer = clean_answer(raw_answer)  # post-process
 
         st.markdown("### Answer")
-        st.write(answer)
+        st.markdown(answer)
 
         # Show sources used
         with st.expander("Sources used"):
@@ -228,4 +250,3 @@ Sources:
 
 else:
     st.info("⬆️ Upload PDFs to begin.")
-
