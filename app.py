@@ -20,6 +20,18 @@ from openai import OpenAI
 
 # ---------- Page ----------
 st.set_page_config(page_title="📄 Policy & PDF Q&A", layout="wide")
+
+# Hide Streamlit's small keyboard/help hint under text inputs/areas
+st.markdown(
+    """
+    <style>
+      /* Hide the tiny "Press Ctrl+Enter…" hint under text inputs/areas */
+      .stTextArea small, .stTextInput small { display: none !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("📄 Policy & PDF Q&A")
 st.caption("Upload PDFs (policy, contract, handbook), then ask natural-language questions. Answers cite pages.")
 
@@ -40,9 +52,10 @@ with st.sidebar:
                                 help="Lower = strict & factual. Higher = more flexible wording.")
         TOP_K = st.slider("Context chunks (K)", 2, 8, 4)
         CHARS_PER_CHUNK = st.slider("Chunk size (chars)", 1000, 4000, 2000, step=250)
+        # 👉 default ON now
         polish_output = st.checkbox(
             "Polish final answer (extra tiny model pass)",
-            value=False,
+            value=True,
             help="Rewrites the answer cleanly (bullets, tidy spacing). Small extra token cost."
         )
 
@@ -60,23 +73,16 @@ def normalize_pdf_text(txt: str) -> str:
     """Clean noisy PDF text BEFORE chunking/embedding."""
     if not txt:
         return ""
-    # Replace ligatures, non-breaking spaces, soft hyphens
     for k, v in LIGATURES.items():
         txt = txt.replace(k, v)
     txt = txt.replace(NBSP, " ").replace(SOFT_HY, "")
-    # Remove markdown markers that later trigger formatting
     txt = txt.replace("**", "").replace("*", "").replace("_", " ")
-    # Collapse whitespace
     txt = re.sub(r"[ \t\r\f\v]+", " ", txt)
-    # Insert missing spaces between digits/letters and letters/digits
     txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)
     txt = re.sub(r"([A-Za-z])(\d)", r"\1 \2", txt)
-    # Fix thousands: "1, 000" -> "1,000"
     txt = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", txt)
-    # Normalize commas: " , " -> ", "
     txt = re.sub(r"\s*,\s*", ", ", txt)
     txt = re.sub(r"\s{2,}", " ", txt).strip()
-    # Common lease/policy artifacts glued together
     fixes = {
         "permonth": "per month",
         "isalso": "is also",
@@ -100,14 +106,10 @@ def read_pdf_text_pymupdf(file_bytes: bytes) -> List[Tuple[int, str]]:
     with fitz.open(stream=file_bytes, filetype="pdf") as doc:
         for i, page in enumerate(doc, start=1):
             words = page.get_text("words") or []
-            # sort by line-ish (y, then x)
             words.sort(key=lambda w: (round(w[1], 1), w[0]))  # (y0, x0)
-            lines = []
-            current_y = None
-            current_line = []
-            last_x1 = None
+            lines, current_line = [], []
+            current_y, last_x1 = None, None
             GAP = 2.0  # points; controls when to insert a space
-
             for x0, y0, x1, y1, wtext, *_ in words:
                 if current_y is None or abs(y0 - current_y) > 2.0:
                     if current_line:
@@ -115,15 +117,12 @@ def read_pdf_text_pymupdf(file_bytes: bytes) -> List[Tuple[int, str]]:
                         current_line = []
                     current_y = y0
                     last_x1 = None
-
                 if last_x1 is not None and (x0 - last_x1) > GAP:
                     current_line.append(" ")
                 current_line.append(wtext)
                 last_x1 = x1
-
             if current_line:
                 lines.append("".join(current_line))
-
             raw = "\n".join(lines)
             pages.append((i, normalize_pdf_text(raw)))
     return pages
@@ -371,7 +370,7 @@ Sources:
         raw_answer = resp.choices[0].message.content
         answer = clean_answer(raw_answer)
 
-        # 5) Optional polish pass (tiny cost)
+        # 5) Optional polish pass (now default ON via sidebar)
         if polish_output:
             status.update(label="Polishing answer…", state="running")
             polish_prompt = f"""
