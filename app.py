@@ -84,15 +84,36 @@ def hash_docs(files) -> str:
 
 def clean_answer(txt: str) -> str:
     """
-    Light cleanup for PDF extraction artifacts the model may echo.
-    - collapse excessive whitespace
-    - fix missing spaces between numbers/words: '1000and' -> '1000 and'
-    - normalize spaces around commas
+    Strong cleanup for PDF artifacts the model may echo.
+    - remove stray asterisks/markdown
+    - collapse whitespace
+    - fix missing spaces 1000and -> 1000 and / word123 -> word 123
+    - normalize commas (1, 000 -> 1,000; spaces around commas)
+    - patch common glued phrases
     """
+    txt = txt.replace("**", "").replace("*", "")
     txt = re.sub(r"\s+", " ", txt)
-    txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)     # 1000and -> 1000 and
-    txt = re.sub(r"\s*,\s*", ", ", txt)                # , spacing
-    return txt.strip()
+    txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)
+    txt = re.sub(r"([A-Za-z])(\d)", r"\1 \2", txt)
+    txt = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", txt)
+    txt = re.sub(r"\s*,\s*", ", ", txt)
+    txt = re.sub(r"\s{2,}", " ", txt).strip()
+
+    fixes = {
+        "permonth": "per month",
+        "isalso": "is also",
+        "andthe": "and the",
+        "andthere": "and there",
+        "securitydeposit": "security deposit",
+        "refundabledeposit": "refundable deposit",
+        "depositis": "deposit is",
+        "rentis": "rent is",
+    }
+    low = txt.lower()
+    for bad, good in fixes.items():
+        if bad in low:
+            txt = re.sub(bad, good, txt, flags=re.IGNORECASE)
+    return txt
 
 # ---------- OpenAI client ----------
 def get_client() -> OpenAI:
@@ -117,7 +138,6 @@ def check_and_add_cost(input_toks=0, output_toks=0, embed_toks=0):
 # ---------- Build index when files uploaded ----------
 index_ready = False
 if uploaded:
-    # cache by content hash within the session
     cache_key = hash_docs(uploaded)
     if "index_cache" not in st.session_state:
         st.session_state.index_cache = {}
@@ -125,91 +145,89 @@ if uploaded:
         chunks, metas, emb_matrix = st.session_state.index_cache[cache_key]
         index_ready = True
     else:
-        st.info("Building index (embedding chunks). This runs only once per upload…")
+        status = st.status("Preparing your documents…", expanded=True)
+        status.update(label="Extracting pages…", state="running")
         all_chunks, metas = [], []
         for uf in uploaded:
             pages = read_pdf_text(uf)
-            # note: scanned PDFs (images) will produce little or no text
             chs = chunk_pages(pages, chars_per_chunk=CHARS_PER_CHUNK)
             for (p1, p2), text in chs:
                 all_chunks.append(text)
                 metas.append({"file": uf.name, "pages": (p1, p2)})
 
         if not all_chunks:
-            st.error("No extractable text found. (Scanned PDFs are not supported without OCR.)")
+            status.update(label="No extractable text found (scanned PDFs need OCR).", state="error")
             st.stop()
 
-        # embed chunks
         client = get_client()
         embed_input_tokens = sum(approx_tokens(c) for c in all_chunks)
         check_and_add_cost(embed_toks=embed_input_tokens)
-
-        with st.spinner("Embedding document chunks…"):
-            emb_resp = client.embeddings.create(
-                model="text-embedding-3-small",
-                input=all_chunks
-            )
+        status.update(label="Embedding chunks…", state="running")
+        emb_resp = client.embeddings.create(model="text-embedding-3-small", input=all_chunks)
         emb_matrix = np.array([e.embedding for e in emb_resp.data], dtype=np.float32)
 
         st.session_state.index_cache[cache_key] = (all_chunks, metas, emb_matrix)
+        status.update(label="Index ready.", state="complete", expanded=False)
         chunks, metas = all_chunks, metas
         index_ready = True
 
 # ---------- QA UI ----------
 if uploaded:
     st.subheader("Ask a question")
-    q = st.text_input("Example: What does the leave policy say about sick days?")
+    q = st.text_area(
+        "Type your question",
+        placeholder="e.g., What does the lease say about rent and the security deposit?",
+        height=80
+    )
     strict = st.checkbox("Strict mode (answer only from the PDFs; say 'Not found' if unclear)", value=True)
 
-    if st.button("🔎 Get answer"):
+    if st.button("🔎 Get answer", type="primary"):
         if not index_ready:
             st.warning("Index not ready yet. Try again.")
             st.stop()
 
         client = get_client()
 
-        # Retrieve top-K chunks by cosine sim
-        # Embed the query
+        status = st.status("Answering…", expanded=True)
+        status.update(label="Embedding your question…", state="running")
         q_tokens = approx_tokens(q)
         check_and_add_cost(embed_toks=q_tokens)
-        with st.spinner("Thinking…"):
-            q_emb = client.embeddings.create(
-                model="text-embedding-3-small",
-                input=q
-            ).data[0].embedding
+        q_emb = client.embeddings.create(model="text-embedding-3-small", input=q).data[0].embedding
 
+        status.update(label="Retrieving relevant passages…", state="running")
         q_vec = np.array(q_emb, dtype=np.float32)
-        sims = [cosine_sim(q_vec, emb) for emb in st.session_state.index_cache[hash_docs(uploaded)][2]]
+        matrix = st.session_state.index_cache[hash_docs(uploaded)][2]
+        sims = [cosine_sim(q_vec, emb) for emb in matrix]
         top_idx = np.argsort(sims)[::-1][:TOP_K]
 
-        # Build context
         selected = []
+        cache = st.session_state.index_cache[hash_docs(uploaded)]
         for i in top_idx:
-            text = st.session_state.index_cache[hash_docs(uploaded)][0][int(i)]
-            meta = st.session_state.index_cache[hash_docs(uploaded)][1][int(i)]
+            text = cache[0][int(i)]
+            meta = cache[1][int(i)]
             p1, p2 = meta["pages"]
             source = f'{meta["file"]} (pp. {p1}-{p2})' if p1 != p2 else f'{meta["file"]} (p. {p1})'
             selected.append((source, text))
 
-        context_blocks = []
-        for src, txt in selected:
-            context_blocks.append(f"[Source: {src}]\n{txt}")
+        context_blocks = [f"[Source: {src}]\n{txt}" for src, txt in selected]
         context = "\n\n---\n\n".join(context_blocks)
 
-        # Guardrails text
+        # Guardrails (paraphrase, cite pages, fix artifacts — still strict if enabled)
         if strict:
             guardrails = (
                 "Answer using only the provided sources.\n"
-                "Quote briefly and **cite the page(s)** like [p. 3] or [Policy.pdf p. 12].\n"
-                "Present the answer in **clean, human-readable sentences**. "
-                "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words). "
-                "Do **not** invent content. If unclear or not present, say **'Not found in the documents.'**"
+                "Do not copy sentences verbatim—paraphrase in clean, human-readable English.\n"
+                "State amounts clearly (e.g., $1,000) and keep units.\n"
+                "Cite the page(s) like [p. 3] or [Policy.pdf p. 12].\n"
+                "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words).\n"
+                "Do not invent content. If unclear or not present, say 'Not found in the documents.'"
             )
         else:
             guardrails = (
                 "Prefer the provided sources; if unclear, you may infer cautiously.\n"
-                "Quote briefly and **cite the page(s)** like [p. 3] or [Policy.pdf p. 12].\n"
-                "Present the answer in **clean, human-readable sentences**. "
+                "Paraphrase in clean, human-readable English.\n"
+                "State amounts clearly (e.g., $1,000) and keep units.\n"
+                "Cite the page(s) like [p. 3] or [Policy.pdf p. 12].\n"
                 "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words)."
             )
 
@@ -225,12 +243,11 @@ Sources:
 {context}
 """.strip()
 
-        # Rough token estimate for budget guard
         in_tokens = approx_tokens(user_prompt)
         out_tokens = 500  # cap
         check_and_add_cost(input_toks=in_tokens, output_toks=out_tokens)
 
-        # Call LLM
+        status.update(label="Generating answer…", state="running")
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": user_prompt}],
@@ -238,15 +255,15 @@ Sources:
             max_tokens=out_tokens,
         )
         raw_answer = resp.choices[0].message.content
-        answer = clean_answer(raw_answer)  # post-process
+        answer = clean_answer(raw_answer)
+
+        status.update(label="Done.", state="complete", expanded=False)
 
         st.markdown("### Answer")
         st.markdown(answer)
 
-        # Show sources used
         with st.expander("Sources used"):
             for src, _txt in selected:
                 st.write(f"• {src}")
-
 else:
     st.info("⬆️ Upload PDFs to begin.")
