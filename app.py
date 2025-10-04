@@ -1,5 +1,5 @@
 import os, io, hashlib, re
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 import numpy as np
 import streamlit as st
 
@@ -40,6 +40,11 @@ with st.sidebar:
                                 help="Lower = strict & factual. Higher = more flexible wording.")
         TOP_K = st.slider("Context chunks (K)", 2, 8, 4)
         CHARS_PER_CHUNK = st.slider("Chunk size (chars)", 1000, 4000, 2000, step=250)
+        polish_output = st.checkbox(
+            "Polish final answer (extra tiny model pass)",
+            value=False,
+            help="Rewrites the answer cleanly (bullets, tidy spacing). Small extra token cost."
+        )
 
 # ---------- Upload ----------
 uploaded = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
@@ -56,10 +61,10 @@ def normalize_pdf_text(txt: str) -> str:
     if not txt:
         return ""
     # Replace ligatures, non-breaking spaces, soft hyphens
-    for k,v in LIGATURES.items():
+    for k, v in LIGATURES.items():
         txt = txt.replace(k, v)
     txt = txt.replace(NBSP, " ").replace(SOFT_HY, "")
-    # Remove stray markdown markers that later trigger formatting
+    # Remove markdown markers that later trigger formatting
     txt = txt.replace("**", "").replace("*", "").replace("_", " ")
     # Collapse whitespace
     txt = re.sub(r"[ \t\r\f\v]+", " ", txt)
@@ -90,16 +95,41 @@ def normalize_pdf_text(txt: str) -> str:
     return txt
 
 def read_pdf_text_pymupdf(file_bytes: bytes) -> List[Tuple[int, str]]:
-    """Use PyMuPDF for cleaner extraction."""
+    """Use PyMuPDF words-based extraction, reconstruct lines with spacing."""
     pages = []
     with fitz.open(stream=file_bytes, filetype="pdf") as doc:
         for i, page in enumerate(doc, start=1):
-            txt = page.get_text("text", flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE) or ""
-            pages.append((i, normalize_pdf_text(txt)))
+            words = page.get_text("words") or []
+            # sort by line-ish (y, then x)
+            words.sort(key=lambda w: (round(w[1], 1), w[0]))  # (y0, x0)
+            lines = []
+            current_y = None
+            current_line = []
+            last_x1 = None
+            GAP = 2.0  # points; controls when to insert a space
+
+            for x0, y0, x1, y1, wtext, *_ in words:
+                if current_y is None or abs(y0 - current_y) > 2.0:
+                    if current_line:
+                        lines.append("".join(current_line))
+                        current_line = []
+                    current_y = y0
+                    last_x1 = None
+
+                if last_x1 is not None and (x0 - last_x1) > GAP:
+                    current_line.append(" ")
+                current_line.append(wtext)
+                last_x1 = x1
+
+            if current_line:
+                lines.append("".join(current_line))
+
+            raw = "\n".join(lines)
+            pages.append((i, normalize_pdf_text(raw)))
     return pages
 
 def read_pdf_text_pypdf(file_bytes: bytes) -> List[Tuple[int, str]]:
-    """Fallback extractor using pypdf."""
+    """Fallback extractor using pypdf (normalized)."""
     pages = []
     reader = PdfReader(io.BytesIO(file_bytes))
     for i, page in enumerate(reader.pages, start=1):
@@ -133,7 +163,7 @@ def chunk_pages(pages: List[Tuple[int, str]], chars_per_chunk=2000, overlap=200)
             continue
         pos = 0
         while pos < len(text):
-            take = text[pos:pos+chars_per_chunk]
+            take = text[pos:pos + chars_per_chunk]
             if not buf:
                 start_page = pno
             buf += ("" if not buf else "\n") + take
@@ -162,18 +192,13 @@ def hash_docs(files) -> str:
 
 def clean_answer(txt: str) -> str:
     """Post-clean the final answer (belt & suspenders)."""
-    # strip markdown-ish markers
     txt = txt.replace("**", "").replace("*", "").replace("_", " ")
-    # whitespace & number/letter spacing
     txt = re.sub(r"\s+", " ", txt)
     txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)
     txt = re.sub(r"([A-Za-z])(\d)", r"\1 \2", txt)
-    # 1, 000 -> 1,000
     txt = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", txt)
-    # commas
     txt = re.sub(r"\s*,\s*", ", ", txt)
     txt = re.sub(r"\s{2,}", " ", txt).strip()
-    # common glue fixes
     fixes = {
         "permonth": "per month",
         "isalso": "is also",
@@ -228,8 +253,7 @@ if uploaded:
             pages = read_pdf_pages(uf)
             chs = chunk_pages(pages, chars_per_chunk=CHARS_PER_CHUNK)
             for (p1, p2), text in chs:
-                # text already normalized by extractor
-                all_chunks.append(text)
+                all_chunks.append(text)  # already normalized
                 metas.append({"file": uf.name, "pages": (p1, p2)})
 
         if not all_chunks:
@@ -311,10 +335,9 @@ if uploaded:
                 "Fix spacing/formatting artifacts from the PDF text (numbers, commas, words)."
             )
 
-        # Nudge the model to structure money answers nicely when relevant
         formatting_hint = (
             "If the question asks about amounts (e.g., rent/deposit/fees), "
-            "output short bullets like:\n"
+            "return them as short bullets:\n"
             "- Monthly Rent: $X\n- Security Deposit: $Y\n- Total due before move-in: $Z\n"
         )
 
@@ -347,6 +370,27 @@ Sources:
         )
         raw_answer = resp.choices[0].message.content
         answer = clean_answer(raw_answer)
+
+        # 5) Optional polish pass (tiny cost)
+        if polish_output:
+            status.update(label="Polishing answer…", state="running")
+            polish_prompt = f"""
+Rewrite the following answer cleanly in bullet points if it contains amounts.
+Keep numbers/currency and the citations like [page N]. Do not add new facts.
+
+Answer:
+{answer}
+""".strip()
+            polish_in = approx_tokens(polish_prompt)
+            polish_out = 300
+            check_and_add_cost(input_toks=polish_in, output_toks=polish_out)
+            resp2 = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": polish_prompt}],
+                temperature=0.1,
+                max_tokens=polish_out,
+            )
+            answer = clean_answer(resp2.choices[0].message.content)
 
         status.update(label="Done.", state="complete", expanded=False)
 
