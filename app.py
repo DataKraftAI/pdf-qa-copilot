@@ -27,13 +27,8 @@ st.markdown(
       .stTextArea small, .stTextInput small { display: none !important; }
       textarea + div small { display: none !important; }
 
-      /* Compact header row + right-aligned language select (not stretched) */
-      .header-row { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
-      .header-right { display:flex; gap:12px; align-items:center; }
-      .lang-box { min-width: 220px; } /* keep it compact */
-      .lang-box label { white-space:nowrap; }
-
-      /* Primary button style */
+      /* Make the top-right language picker compact */
+      .lang-compact > div[data-baseweb="select"] { max-width: 230px; }
       .stButton>button[kind="primary"]{
           background-color:#ff4b4b;
           color:#fff; font-weight:700;
@@ -44,22 +39,28 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ------------------------- Language picker (header, compact) -------------------------
-# Header row: left spacer (we’ll render title after), right language select
-st.markdown('<div class="header-row">', unsafe_allow_html=True)
-col_left, col_right = st.columns([1, 0.34])
-with col_right:
-    # compact select at top-right
-    with st.container():
-        st.markdown('<div class="header-right">', unsafe_allow_html=True)
-        lang = st.selectbox("🌐 Language / Sprache", ["English", "Deutsch"], index=0, key="hdr_lang", label_visibility="visible")
-        st.markdown('</div>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
+# ------------------------- Header row with true right-aligned select ----------
+hdr_left, hdr_spacer, hdr_right = st.columns([0.62, 0.18, 0.20], gap="small")
+
+with hdr_left:
+    st.title("📄 Policy & PDF Q&A")
+    st.caption("Upload PDFs (policy, contract, handbook), then ask natural-language questions. Answers cite pages.")
+
+with hdr_right:
+    st.markdown("**Language**", help="Sprache")
+    # Collapse the widget label so it stays compact; column keeps it at the right
+    lang = st.selectbox(
+        "",
+        ["English", "Deutsch"],
+        index=0,
+        key="hdr_lang",
+        label_visibility="collapsed",
+        help="Answer language follows this selection.",
+    )
+    st.markdown('<div class="lang-compact"></div>', unsafe_allow_html=True)
 
 TXT = {
     "English": {
-        "title": "📄 Policy & PDF Q&A",
-        "caption": "Upload PDFs (policy, contract, handbook), then ask natural-language questions. Answers cite pages.",
         "settings": "Settings",
         "upload": "Upload one or more PDFs",
         "ask": "Ask a question",
@@ -78,8 +79,6 @@ TXT = {
         "budget_reached": "⚠️ Demo budget reached."
     },
     "Deutsch": {
-        "title": "📄 Richtlinien- & PDF-Fragen",
-        "caption": "Laden Sie PDFs hoch (Richtlinien, Verträge, Handbücher) und stellen Sie Fragen in natürlicher Sprache. Antworten enthalten Seitenangaben.",
         "settings": "Einstellungen",
         "upload": "Eine oder mehrere PDFs hochladen",
         "ask": "Frage stellen",
@@ -98,9 +97,6 @@ TXT = {
         "budget_reached": "⚠️ Demo-Budget erreicht."
     }
 }[lang]
-
-st.title(TXT["title"])
-st.caption(TXT["caption"])
 
 # ------------------------- Sidebar (budget + advanced) -------------------------
 with st.sidebar:
@@ -132,11 +128,11 @@ def normalize_pdf_text(txt: str) -> str:
     txt = txt.replace(NBSP," ").replace(SOFT_HY,"")
     txt = txt.replace("**","").replace("*","").replace("_"," ")
     txt = re.sub(r"[ \t\r\f\v]+"," ",txt)
-    txt = re.sub(r"(\d)([A-Za-z])", r"\\1 \\2", txt)
-    txt = re.sub(r"([A-Za-z])(\d)", r"\\1 \\2", txt)
-    txt = re.sub(r"(?<=\\d),\\s+(?=\\d{3}\\b)", ",", txt)
-    txt = re.sub(r"\\s*,\\s*", ", ", txt)
-    txt = re.sub(r"\\s{2,}", " ", txt).strip()
+    txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)
+    txt = re.sub(r"([A-Za-z])(\d)", r"\1 \2", txt)
+    txt = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", txt)
+    txt = re.sub(r"\s*,\s*", ", ", txt)
+    txt = re.sub(r"\s{2,}", " ", txt).strip()
     return txt
 
 def read_pdf_text_pymupdf(file_bytes: bytes) -> List[Tuple[int,str]]:
@@ -150,8 +146,7 @@ def read_pdf_text_pymupdf(file_bytes: bytes) -> List[Tuple[int,str]]:
             GAP = 2.0
             for x0,y0,x1,y1,wtext,*_ in words:
                 if current_y is None or abs(y0-current_y) > 2.0:
-                    if current_line:
-                        lines.append("".join(current_line)); current_line=[]
+                    if current_line: lines.append("".join(current_line)); current_line=[]
                     current_y=y0; last_x1=None
                 if last_x1 is not None and (x0-last_x1) > GAP:
                     current_line.append(" ")
@@ -216,10 +211,10 @@ def clean_answer(txt: str) -> str:
     txt = re.sub(r"[ \t\f\v]+"," ",txt)
     txt = re.sub(r"\n[ \t]+","\n",txt)
     txt = re.sub(r"\n{3,}","\n\n",txt)
-    txt = re.sub(r"(\d)([A-Za-z])", r"\\1 \\2", txt)
-    txt = re.sub(r"([A-Za-z])(\d)", r"\\1 \\2", txt)
-    txt = re.sub(r"(?<=\\d),\\s+(?=\\d{3}\\b)", ",", txt)
-    txt = re.sub(r"\\s*,\\s*", ", ", txt)
+    txt = re.sub(r"(\d)([A-Za-z])", r"\1 \2", txt)
+    txt = re.sub(r"([A-Za-z])(\d)", r"\1 \2", txt)
+    txt = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", txt)
+    txt = re.sub(r"\s*,\s*", ", ", txt)
     return txt.strip()
 
 # ------------------------- OpenAI client -------------------------
@@ -298,7 +293,7 @@ if uploaded:
         context_blocks = [f"[Source: {src}]\n{txt}" for src, txt in selected]
         context = "\n\n---\n\n".join(context_blocks)
 
-        # Language clause so the model answers in the selected language
+        # Make the model answer in the selected language
         answer_lang = "German" if lang == "Deutsch" else "English"
         language_clause = f"Please answer in {answer_lang}."
 
